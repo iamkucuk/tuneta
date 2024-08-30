@@ -19,6 +19,10 @@ from tuneta.config import *
 from tuneta.optimize import Optimize
 from tuneta.utils import col_name, distance_correlation
 
+import os
+import joblib
+
+from tqdm.auto import tqdm 
 
 # Distance correlation
 def dc(p0, p1):
@@ -34,6 +38,30 @@ class TuneTA:
         self.fitted = []
         self.n_jobs = n_jobs
         self.verbose = verbose
+        self.remaining_tasks = []
+        self.completed_tasks = 0
+
+    def save_checkpoint(self, filename="checkpoint.pkl"):
+        """Saves the current state of the fitting process."""
+        checkpoint_data = {
+            'fitted': self.fitted,
+            'remaining_tasks': self.remaining_tasks,
+            'completed_tasks': self.completed_tasks,
+        }
+        joblib.dump(checkpoint_data, filename)
+
+    def load_checkpoint(self, filename="checkpoint.pkl"):
+        """Loads the state of the fitting process from a checkpoint."""
+        if os.path.exists(filename):
+            checkpoint_data = joblib.load(filename)
+            self.fitted = checkpoint_data.get('fitted', [])
+            self.remaining_tasks = checkpoint_data.get('remaining_tasks', [])
+            self.completed_tasks = checkpoint_data.get('completed_tasks', 0)
+            if self.verbose:
+                print(f"Loaded checkpoint from {filename}")
+        else:
+            if self.verbose:
+                print(f"No checkpoint found at {filename}")
 
     def fit(
         self,
@@ -46,6 +74,9 @@ class TuneTA:
         max_clusters=10,
         min_target_correlation=0.001,
         remove_consecutive_duplicates=False,
+        checkpoint_interval=10,
+        resume=False,
+        checkpoint_file="checkpoint.pkl"
     ):
         """
         Optimize indicator parameters to maximize correlation
@@ -55,7 +86,14 @@ class TuneTA:
         :param indicators: List of indicators to optimize
         :param ranges: Parameter search space
         :param early_stop: Max number of optimization trials before stopping
+        :param checkpoint_interval: Number of optimizations after which to save a checkpoint
+        :param resume: Whether to resume from a checkpoint
+        :param checkpoint_file: The file to save/load checkpoints
         """
+        # Optionally load from a checkpoint
+        if resume:
+            self.load_checkpoint(checkpoint_file)
+
         # No missing values allowed
         if X.isna().any().any() or y.isna().any():
             raise ValueError("X and y cannot contain missing values")
@@ -126,9 +164,7 @@ class TuneTA:
                         param = "open"
                     if param == "real":
                         fn += f"X.close, "
-                    elif param == "ohlc":
-                        fn += f"X, "
-                    elif param == "ohlcv":
+                    elif param == "ohlc" or param == "ohlcv":
                         fn += f"X, "
                     elif param in tune_series:
                         fn += f"X.{param}, "
@@ -175,10 +211,26 @@ class TuneTA:
                             remove_consecutive_duplicates=remove_consecutive_duplicates,
                         ).fit)(X, y, idx=idx, max_clusters=max_clusters, verbose=self.verbose, early_stop=early_stop)
                     )
-        self.fitted = Parallel(n_jobs=self.n_jobs)(tasks)
 
-        # Fits must contain best trial data
-        self.fitted = [f for f in self.fitted if len(f.study.user_attrs) > 0]
+        # Progress bar
+        completed_tasks = 0
+        pbar = tqdm(total=len(tasks), desc="Optimizing", unit="tasks")
+
+        tasks = Parallel(n_jobs=self.n_jobs)(tasks)
+
+        self.fitted = []
+        for task in tasks:
+            completed_tasks += 1
+            pbar.update(1)  # Update the progress bar
+            if len(task.study.user_attrs) > 0:
+                self.fitted.append(task)
+
+            if completed_tasks % checkpoint_interval == 0:
+                self.save_checkpoint(checkpoint_file)
+                if self.verbose:
+                    print(f"Checkpoint saved: {completed_tasks} tasks completed.")
+
+        pbar.close()  # Close the progress bar
 
         if len(self.fitted) == 0:
             raise RuntimeError("No successful trials")
