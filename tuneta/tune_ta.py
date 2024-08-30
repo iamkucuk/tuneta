@@ -38,8 +38,8 @@ class TuneTA:
         self.fitted = []
         self.n_jobs = n_jobs
         self.verbose = verbose
-        self.remaining_tasks = []
-        self.completed_tasks = 0
+        self.remaining_tasks = {}
+        self.completed_tasks = []
 
     def save_checkpoint(self, filename="checkpoint.pkl"):
         """Saves the current state of the fitting process."""
@@ -55,8 +55,8 @@ class TuneTA:
         if os.path.exists(filename):
             checkpoint_data = joblib.load(filename)
             self.fitted = checkpoint_data.get('fitted', [])
-            self.remaining_tasks = checkpoint_data.get('remaining_tasks', [])
-            self.completed_tasks = checkpoint_data.get('completed_tasks', 0)
+            self.remaining_tasks = checkpoint_data.get('remaining_tasks', {})
+            self.completed_tasks = checkpoint_data.get('completed_tasks', [])
             if self.verbose:
                 print(f"Loaded checkpoint from {filename}")
         else:
@@ -128,7 +128,7 @@ class TuneTA:
         # Parameters contained in config.py are tuned
 
         # Iterate user defined search space ranges
-        tasks = []
+        # tasks = []
         for low, high in ranges:
             if low <= 1:
                 raise ValueError("Range low must be > 1")
@@ -196,34 +196,37 @@ class TuneTA:
 
                 # Only optimize indicators that contain tunable parameters
                 if suggest:
-                    tasks.append(
-                        delayed(Optimize(
-                            function=fn,
-                            n_trials=trials,
-                            remove_consecutive_duplicates=remove_consecutive_duplicates,
-                        ).fit)(X, y, idx=idx, max_clusters=max_clusters, verbose=self.verbose, early_stop=early_stop)
-                    )
+                    self.remaining_tasks[fn] = delayed(Optimize(
+                        function=fn,
+                        n_trials=trials,
+                        remove_consecutive_duplicates=remove_consecutive_duplicates,
+                    ).fit)(X, y, idx=idx, max_clusters=max_clusters, verbose=self.verbose, early_stop=early_stop)
                 else:
-                    tasks.append(
-                        delayed(Optimize(
-                            function=fn,
-                            n_trials=1,
-                            remove_consecutive_duplicates=remove_consecutive_duplicates,
-                        ).fit)(X, y, idx=idx, max_clusters=max_clusters, verbose=self.verbose, early_stop=early_stop)
-                    )
+                    self.remaining_tasks[fn] = delayed(Optimize(
+                        function=fn,
+                        n_trials=1,
+                        remove_consecutive_duplicates=remove_consecutive_duplicates,
+                    ).fit)(X, y, idx=idx, max_clusters=max_clusters, verbose=self.verbose, early_stop=early_stop)
 
         # Progress bar
         completed_tasks = 0
-        pbar = tqdm(total=len(tasks), desc="Optimizing", unit="tasks")
+        for task in self.completed_tasks:
+            del self.remaining_tasks[task]
+            completed_tasks += 1
 
-        tasks = Parallel(n_jobs=self.n_jobs)(tasks)
+        print(f"Found {completed_tasks} completed tasks from previous run.")
+        
+        pbar = tqdm(total=len(self.remaining_tasks), desc="Optimizing", unit="tasks")
+
+        results = Parallel(n_jobs=self.n_jobs)(self.remaining_tasks.values())
 
         self.fitted = []
-        for task in tasks:
+        for key, result in zip(self.remaining_tasks.keys(), results):
             completed_tasks += 1
             pbar.update(1)  # Update the progress bar
-            if len(task.study.user_attrs) > 0:
-                self.fitted.append(task)
+            if len(result.study.user_attrs) > 0:
+                self.fitted.append(result)
+                self.completed_tasks.append(key)  # Add the key of the completed task
 
             if completed_tasks % checkpoint_interval == 0:
                 self.save_checkpoint(checkpoint_file)
